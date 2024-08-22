@@ -2,52 +2,186 @@
 
 import sys
 import subprocess
-
+from threading import Timer, Thread
 import json
 import logging
 import requests
 import time
-from datetime import date, timedelta
+from typing import Optional, Dict, Any, List, Union, Tuple  # Add Tuple to the import list
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackContext, MessageHandler, filters
-
+from telegram.error import BadRequest, TimedOut
+import urllib.parse
+import html
 
 # Set up logging
-class SimpleUpdateFilter(logging.Filter):
-    def filter(self, record):
-        if "HTTP Request: POST" in record.getMessage() and "/getUpdates" in record.getMessage():
-            record.msg = "Bot updating"
-            record.args = ()
-        return True
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger('telegram_bot')
+    logger.setLevel(logging.INFO)  # Set to DEBUG to capture all log levels
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
 
-logger = logging.getLogger()
-httpx_logger = logging.getLogger('httpx')
-httpx_logger.addFilter(SimpleUpdateFilter())
+    # Optional: File handler (if you want to log to a file as well)
+    # file_handler = logging.FileHandler('telegram_bot.log')
+    # file_handler.setLevel(logging.DEBUG)
+    # file_handler.setFormatter(console_formatter)
+    # logger.addHandler(file_handler)
 
-def send_message_to_topic(bot_token, chat_id, topic_id, message):
+    return logger
+
+logger = setup_logger()
+
+# Global cache dictionary
+secret_cache: Dict[str, Tuple[str, float]] = {}
+CACHE_TTL: int = 3600  # Cache time-to-live in seconds (e.g., 1 hour)
+
+
+def cache_refresh_scheduler() -> None:
+    """
+    Periodically refreshes the cached secrets.
+    """
+    for vault_item in list(secret_cache.keys()):
+        get_1password_secret(vault_item, force_refresh=True)
+    # Schedule the next refresh
+    Timer(CACHE_TTL / 2, cache_refresh_scheduler).start()
+
+import re
+
+def get_1password_secret(
+    vault_item: str, retries: int = 5, backoff_factor: int = 2, force_refresh: bool = False
+) -> Optional[str]:
+    """
+    Retrieve a secret from 1Password with retry logic and caching.
+    
+    :param vault_item: The 1Password item path (e.g., "op://vault/item").
+    :param retries: The maximum number of retries in case of rate limiting.
+    :param backoff_factor: The backoff multiplier for the retry delay.
+    :param force_refresh: If True, forces a refresh of the cached secret.
+    :return: The secret as a cleaned string or None if retrieval fails.
+    """
+    
+    # Check if the secret is cached and still valid
+    if not force_refresh:
+        if vault_item in secret_cache:
+            cached_secret, timestamp = secret_cache[vault_item]
+            if time.time() - timestamp < CACHE_TTL:
+                logger.debug(f"Using cached secret for {vault_item}")
+                return cached_secret
+            else:
+                logger.debug(f"Cached secret for {vault_item} has expired. Fetching a new one.")
+        else:
+            logger.debug(f"No cached secret found for {vault_item}. Fetching a new one.")
+
+    for attempt in range(retries):
+        try:
+            # Source the ~/.zshrc and capture the environment variables
+            command = f"source ~/.zshrc && op read {vault_item}"
+            logger.debug(f"Running command: {command}")
+
+            result = subprocess.run(
+                ["zsh", "-c", command],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            secret = result.stdout.strip()
+            # logger.debug(f"Raw secret retrieved for {vault_item}: {repr(secret)}")
+
+            # Remove lines that are not part of the secret (e.g., 'Agent pid' lines)
+            cleaned_secret = re.sub(r'^.*Agent pid.*$', '', secret, flags=re.MULTILINE).strip()
+
+            # Log the cleaned secret for debugging
+            logger.debug(f"Cleaned secret for {vault_item}: {repr(cleaned_secret)}")
+
+            # Validate the cleaned secret
+            if not cleaned_secret:
+                logger.error(f"Cleaned secret for {vault_item} is empty. This may indicate an issue with retrieval.")
+                return None
+
+            # Cache the cleaned secret
+            secret_cache[vault_item] = (cleaned_secret, time.time())
+            logger.info(f"Secret for {vault_item} retrieved, cleaned, and cached.")
+
+            return cleaned_secret
+
+        except subprocess.CalledProcessError as e:
+            if "rate-limited" in e.stderr.lower():
+                wait_time = backoff_factor ** attempt
+                logger.warning(f"Rate limit hit. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Failed to retrieve the secret: {e}")
+                return None
+
+    logger.error(f"Failed to retrieve the secret after {retries} attempts.")
+    return None
+
+
+def send_message_to_topic(
+    bot_token: str, chat_id: str, topic_id: str, message: str, chunk_size: int = 4096, retries: int = 3, timeout: int = 10, parse_mode: Optional[str] = "Markdown"
+) -> Optional[dict]:
     url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
-    params = {
-        'chat_id': chat_id,
-        'parse_mode': 'Markdown',
-        'text': message,
-        'message_thread_id': topic_id
-    }
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"Failed to send message to topic: {e}")
-        return None
 
-def delete_message(bot_token, chat_id, topic_id, message_id):
-    url = f'https://api.telegram.org/bot{bot_token}/deleteMessage'
-    params = {
+    # Split the message into chunks if it exceeds the chunk size
+    message_sections = message.split("\n\n")
+    message_chunks = []
+    current_chunk = ""
+
+    for section in message_sections:
+        if len(current_chunk) + len(section) + 2 <= chunk_size:
+            current_chunk += f"{section}\n\n"
+        else:
+            message_chunks.append(current_chunk.strip())
+            current_chunk = f"{section}\n\n"
+
+    if current_chunk:
+        message_chunks.append(current_chunk.strip())
+
+    for attempt in range(retries):
+        try:
+            for chunk in message_chunks:
+                params = {
+                    'chat_id': chat_id,
+                    'text': chunk,
+                    'message_thread_id': topic_id
+                }
+                if parse_mode:
+                    params['parse_mode'] = parse_mode
+                
+                response = requests.get(url, params=params, timeout=timeout)
+                response.raise_for_status()
+                time.sleep(0.5)
+            return response.json()
+        except requests.HTTPError as e:
+            logger.error(f"HTTPError on attempt {attempt + 1}: {e}")
+            time.sleep(2)
+        except requests.RequestException as e:
+            logger.error(f"RequestException on attempt {attempt + 1}: {e}")
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            break
+    return None
+
+def delete_message(bot_token: str, chat_id: Union[str, int], topic_id: Union[str, int], message_id: int) -> bool:
+    """
+    Delete a specific message in a Telegram topic.
+    
+    :param bot_token: The Telegram bot token.
+    :param chat_id: The chat ID where the message exists.
+    :param topic_id: The topic ID within the chat.
+    :param message_id: The ID of the message to delete.
+    :return: True if the message was deleted, False otherwise.
+    """
+    url: str = f'https://api.telegram.org/bot{bot_token}/deleteMessage'
+    params: Dict[str, Union[str, int]] = {
         'chat_id': chat_id,
         'message_thread_id': topic_id,
         'message_id': message_id
@@ -60,177 +194,214 @@ def delete_message(bot_token, chat_id, topic_id, message_id):
         logger.error(f"Failed to delete message: {e}")
         return False
 
-def delete_all_messages(bot_token, chat_id, topic_id):
+def delete_all_messages(bot_token: str, chat_id: Union[str, int], topic_id: Union[str, int]) -> None:
+    """
+    Delete all messages in a specific Telegram topic.
+    
+    :param bot_token: The Telegram bot token.
+    :param chat_id: The chat ID where the messages exist.
+    :param topic_id: The topic ID within the chat.
+    """
     try:
-        message_id = send_message_to_topic(bot_token, chat_id, topic_id, 'Last message')['result']['message_id']
-        while delete_message(bot_token, chat_id, topic_id, message_id):
+        last_message_response: Optional[Dict[str, Any]] = send_message_to_topic(bot_token, chat_id, topic_id, 'Clearing topic ...')
+        if not last_message_response or not last_message_response.get('ok'):
+            logger.error(f"Failed to send clearing message: {last_message_response}")
+            return
+
+        message_id: int = last_message_response['result']['message_id']
+
+        while message_id > 0:
+            if not delete_message(bot_token, chat_id, topic_id, message_id):
+                break
             message_id -= 1
+
     except Exception as e:
         logger.error(f"Failed to delete all messages: {e}")
 
-def get_1password_secret(vault_item):
-    import os
-    
+async def handle_command(update: Update, context: CallbackContext, script_name: str, additional_args: Optional[List[str]] = None) -> None:
+    chat_id: str = str(update.message.chat_id)
+    topic_id: str = str(update.message.message_thread_id) if update.message.message_thread_id is not None else ''
+    bot_token: str = context.bot.token
+    args: List[str] = context.args if additional_args is None else context.args + additional_args
+
+    # Add the chat ID, topic ID, and bot token to the command arguments
+    args += [chat_id, topic_id, bot_token]
+
+    command: str = script_name.replace("_handle.py", "")
+    acknowledgment_message: str = f"Command {command} received. Executing..."
+
+    # Send acknowledgment message
+    send_message_to_topic(bot_token, chat_id, topic_id, acknowledgment_message, parse_mode=None)
+
+    # Execute the command
+    output: str = execute_command(script_name, args)
+
+    if output:
+        # Replace problematic characters
+        output = output.replace("'", "").replace("[", "").replace("]", "")
+        send_message_to_topic(bot_token, chat_id, topic_id, output, parse_mode=None)
+    else:
+        error_message: str = f"Command {command} executed, but no output was returned."
+        error_message = error_message.replace("'", "").replace("[", "").replace("]", "")
+        send_message_to_topic(bot_token, chat_id, topic_id, error_message, parse_mode=None)
+
+def execute_command(script_name: str, args: List[str]) -> str:
     try:
-        result = subprocess.run(
-            ["zsh", "-c", "source ~/.zshrc && env"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        env_vars = dict(line.split("=", 1) for line in result.stdout.splitlines() if '=' in line)
-        op_token = env_vars.get('OP_SERVICE_ACCOUNT_TOKEN')
-        if not op_token:
-            raise EnvironmentError("OP_SERVICE_ACCOUNT_TOKEN is not set in the environment variables.")
-        result = subprocess.run(
-            ["op", "read", vault_item],
-            capture_output=True,
-            text=True,
-            check=True,
-            env={**os.environ, **env_vars}
-        )
+        command = [sys.executable, script_name] + args
+        result = subprocess.run(command, capture_output=True, text=True)
+        result.check_returncode()  # This will raise CalledProcessError if the command fails
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to retrieve the secret: {e}")
-        return None
-    except EnvironmentError as env_err:
-        logger.error(f"Environment Error: {env_err}")
-        return None
-    except Exception as ex:
-        logger.error(f"An unexpected error occurred: {ex}")
-        return None
+        logger.error(f"Command {script_name} failed: {e}")
+        return f"Error executing command {script_name}:\n{e}"
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return f"Unexpected error executing command {script_name}:\n{e}"
 
-async def handle_unknown_command(update: Update, context: CallbackContext):
-    logger.info(f"Received unknown command: {update.message.text}")
-    chat_id = update.message.chat_id
-    topic_id = update.message.message_thread_id
-    bot_token = context.bot.token
+async def handle_unknown_command(update: Update, context: CallbackContext) -> None:
+    """
+    Handle unknown commands by sending a warning message.
     
-    error_message = "Unrecognized command. Please use a valid command."
-    logger.info(error_message)
-    send_message_to_topic(bot_token, chat_id, topic_id, error_message)
-    
+    :param update: The Telegram update object.
+    :param context: The callback context object.
+    """
+    chat_id: str = str(update.message.chat_id)
+    topic_id: str = str(update.message.message_thread_id)
+    bot_token: str = context.bot.token
 
-async def handle_clear(update: Update, context: CallbackContext):
+    unknown_command: str = update.message.text
+    message: str = f"Unknown command {unknown_command}. Please use a valid command."
+    logger.warning(f"Unknown command received: {unknown_command}")
+    send_message_to_topic(bot_token, chat_id, topic_id, message)
+
+async def handle_error(update: Optional[Update], context: CallbackContext) -> None:
+    """
+    Handle errors in command processing by notifying the user.
+    
+    :param update: The Telegram update object.
+    :param context: The callback context object.
+    """
+    chat_id: Optional[str] = str(update.message.chat_id) if update and update.message else None
+    topic_id: Optional[str] = str(update.message.message_thread_id) if update and update.message else None
+    bot_token: Optional[str] = context.bot.token if context.bot else None
+
+    if bot_token and chat_id and topic_id:
+        message: str = "An error occurred while processing your command. Please try again later."
+        send_message_to_topic(bot_token, chat_id, topic_id, message)
+    
+    logger.error(f"Error in command handling: {context.error}")
+
+async def handle_clear(update: Update, context: CallbackContext) -> None:
+    """
+    Handle the /clear command by deleting all messages in the current topic.
+    
+    :param update: The Telegram update object.
+    :param context: The callback context object.
+    """
     logger.info("Received command /clear")
-    chat_id = update.message.chat_id
-    topic_id = update.message.message_thread_id
-    bot_token = context.bot.token
+    chat_id: int = update.message.chat_id
+    topic_id: int = update.message.message_thread_id
+    bot_token: str = context.bot.token
 
     delete_all_messages(bot_token, chat_id, topic_id)
 
-async def handle_info(THREAD_ID_TO_TOPIC_NAME: dict, update: Update, context: CallbackContext):
+async def handle_info(THREAD_ID_TO_TOPIC_NAME: Dict[str, str], update: Update, context: CallbackContext) -> None:
+    """
+    Handle the /info command by providing details about the current topic.
+    
+    :param THREAD_ID_TO_TOPIC_NAME: Mapping from thread IDs to topic names.
+    :param update: The Telegram update object.
+    :param context: The callback context object.
+    """
     logger.info("Received command /info")
     
-    chat_id = update.message.chat_id
-    chat_title = update.message.chat.title if update.message.chat.title else "No Title"
-    thread_id = str(update.message.message_thread_id)  # Ensure thread_id is a string
-    topic_name = THREAD_ID_TO_TOPIC_NAME.get(thread_id, "Unknown Topic")
+    chat_id: int = update.message.chat_id
+    chat_title: str = update.message.chat.title if update.message.chat.title else "No Title"
+    thread_id: str = str(update.message.message_thread_id)
+    topic_name: str = THREAD_ID_TO_TOPIC_NAME.get(thread_id, "Unknown Topic")
 
-    message = f"**Topic Information:**\nChannel Name: {chat_title}\nChat ID: {chat_id}\nThread ID: {thread_id}\nTopic Name: {topic_name}"
+    message: str = f"**Topic Information:**\nChannel Name: {chat_title}\nChat ID: {chat_id}\nThread ID: {thread_id}\nTopic Name: {topic_name}"
     
-    response = send_message_to_topic(context.bot.token, chat_id, thread_id, message)
+    response: Optional[Dict[str, Any]] = send_message_to_topic(context.bot.token, chat_id, thread_id, message)
     if response and response.get('ok'):
         logger.info("Message sent successfully")
     else:
         logger.error("Failed to send message")
 
-
-    # scan_time = time.strftime('%H:%M %a, %Y/%m/%d')
-    
-async def handle_ratings(update: Update, context: CallbackContext):
-    logger.info("Received command /ratings")
-    chat_id = update.message.chat_id
-    topic_id = update.message.message_thread_id
-    bot_token = context.bot.token
-
-    try:
-        # Execute the ratings.py script
-        result = subprocess.run(["./ratings.py"], capture_output=True, text=True)
-        result.check_returncode()  # Raise an error if the command failed
-
-        output = result.stdout.strip() or "No output from the ratings script."
-        logger.info(f"Ratings script executed successfully with output: {output}")
-
-        # Send the script's output to the Telegram topic
-        send_message_to_topic(bot_token, chat_id, topic_id, f"**Ratings Results:**\n```\n{output}\n```")
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to execute ratings.py: {e}")
-        send_message_to_topic(bot_token, chat_id, topic_id, "Failed to execute ratings script.")
-    except Exception as ex:
-        logger.error(f"An unexpected error occurred while executing ratings.py: {ex}")
-        send_message_to_topic(bot_token, chat_id, topic_id, "An unexpected error occurred while executing ratings script.")
-
-async def handle_sample(update: Update, context: CallbackContext):
-    logger.info("Received command /sample")
-    chat_id = update.message.chat_id
-    topic_id = update.message.message_thread_id
-    bot_token = context.bot.token
-
-    if len(context.args) < 1:
-        send_message_to_topic(bot_token, chat_id, topic_id, "Please specify a function and optional arguments: `/sample func1 [args]` or `/sample func2 [args]`.")
-        return
-
-    func_name = context.args[0]
-    func_args = context.args[1:]  # Collect any additional arguments
-
-    try:
-        # Execute the sample.py script with the specified function and arguments
-        command = ["./sample.py", func_name] + func_args
-        result = subprocess.run(command, capture_output=True, text=True)
-        result.check_returncode()  # Raise an error if the command failed
-
-        output = result.stdout.strip() or f"No output from {func_name}."
-        logger.info(f"sample.py {func_name} executed successfully with output: {output}")
-
-        # Send the script's output to the Telegram topic
-        send_message_to_topic(bot_token, chat_id, topic_id, f"**{func_name.capitalize()} Results:**\n```\n{output}\n```")
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to execute {func_name} in sample.py: {e}")
-        send_message_to_topic(bot_token, chat_id, topic_id, f"Failed to execute {func_name} in the sample script.")
-    except Exception as ex:
-        logger.error(f"An unexpected error occurred while executing {func_name} in sample.py: {ex}")
-        send_message_to_topic(bot_token, chat_id, topic_id, f"An unexpected error occurred while executing {func_name} in the sample script.")
-
-def main():
+def main() -> None:
+    """
+    Main function to start the Telegram bot and register command handlers.
+    """
     logger.info(f"Using Python interpreter: {sys.executable}")
     
-    trading_group_secret = get_1password_secret("op://dev/Telegrambot/trading")
-    trading_group = json.loads(trading_group_secret) if trading_group_secret else None
+    # Retrieve the secret as a string
+    trading_group_secret: Optional[str] = get_1password_secret("op://dev/Telegrambot/trading")
     
-    # Create a reverse mapping from thread_id to topic_name
-    THREAD_ID_TO_TOPIC_NAME = {v: k for k, v in trading_group.items()}
-    logger.info(THREAD_ID_TO_TOPIC_NAME)
-    
-    if not trading_group:
-        logger.error("Failed to retrieve trading group information from 1Password")
+    if trading_group_secret is None:
+        logger.error("Failed to retrieve trading group information from 1Password or it's empty.")
         return
     
-    bot_token = trading_group.get('token')
+    # Log the type and content of trading_group_secret for debugging
+    logger.debug(f"Raw trading group secret (length: {len(trading_group_secret)}): {repr(trading_group_secret)}")
+    
+    # Attempt to parse the secret as JSON to ensure it's a dictionary
+    try:
+        trading_group: Optional[Dict[str, str]] = json.loads(trading_group_secret)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode trading group JSON from 1Password secret 'op://dev/Telegrambot/trading': {e}")
+        logger.debug(f"Content of the secret that caused the error: {repr(trading_group_secret)}")
+        return
+    
+    if not isinstance(trading_group, dict):
+        logger.error("The trading group data is not a dictionary.")
+        return
+    
+    THREAD_ID_TO_TOPIC_NAME: Dict[str, str] = {v: k for k, v in trading_group.items()}
+    logger.info(f"THREAD_ID_TO_TOPIC_NAME: {THREAD_ID_TO_TOPIC_NAME}")
+    
+    bot_token: Optional[str] = trading_group.get('token')
 
-    if not all([bot_token]):
+    if not bot_token:
         logger.error("Missing bot_token. Exiting.")
         return
     
     logger.info("Starting bot")
     application = Application.builder().token(bot_token).build()
     
-    # Handler for unknown commands
-    application.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
-    
-    # Handler for clear command that clear all previous posts
     application.add_handler(CommandHandler('clear', handle_clear))
-
-    # Add the info handler, passing the THREAD_ID_TO_TOPIC_NAME
     application.add_handler(CommandHandler('info', lambda update, context: handle_info(THREAD_ID_TO_TOPIC_NAME, update, context)))
+    
+    screeners_command: str = "screeners"
+    application.add_handler(CommandHandler(screeners_command, lambda update, context: handle_command(update, context, f"{screeners_command}_handle.py")))
+    
+    tickers_command: str = "tickers"
+    application.add_handler(CommandHandler(tickers_command, lambda update, context: handle_command(update, context, f"{tickers_command}_handle.py")))
+        
+    gateway_command: str = "gateway"
+    application.add_handler(CommandHandler(gateway_command, lambda update, context: handle_command(update, context, f"{gateway_command}_handle.py")))
+    
+    trade_command: str = "trade"
+    application.add_handler(CommandHandler(trade_command, lambda update, context: handle_command(update, context, f"{trade_command}_handle.py")))
 
-    application.add_handler(CommandHandler('ratings', handle_ratings))
-    application.add_handler(CommandHandler('sample', handle_sample))
-
+    application.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
+    application.add_error_handler(handle_error)
+    
     logger.info("Bot is polling for updates")
-    application.run_polling()
+    try:
+        application.run_polling()
+    except TimedOut as e:
+        logger.error(f"Polling timed out: {e}")
+    except BadRequest as e:
+        logger.error(f"Bad request error during polling: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during polling: {e}")
+    finally:
+        logger.info("Bot is shutting down gracefully.")
+
 
 if __name__ == '__main__':
+    # Start the cache refresh scheduler in a separate thread
+    Thread(target=cache_refresh_scheduler, daemon=True).start()
+    
+    # Start the main bot process
     main()
