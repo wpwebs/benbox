@@ -1,40 +1,70 @@
-#!/benbox/bin/python
+#! .benbox/bin/python
 
 import subprocess
 import logging
 import sys
 import json
 from typing import Optional, Tuple, List
-
 from telegram_bot import get_1password_secret
 
-# Set up logging specifically for this script
-logger = logging.getLogger('gateway_handle')
-logger.setLevel(logging.INFO)  # Set to DEBUG to capture all levels of logs
 
-# Create a console handler and set the level to DEBUG
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
+def setup_logger() -> logging.Logger:
+    """Set up a logger that outputs INFO level to the console and DEBUG level to a file."""
+    logger = logging.getLogger('gateway_handle')
+    logger.setLevel(logging.DEBUG)
 
-# Create a formatter and set it to the handler
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
+    # Ensure we don't add multiple handlers
+    if not any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers):
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        console_handler.setLevel(logging.INFO)  # Default to INFO level
+        logger.addHandler(console_handler)
+        logger.debug("Console handler added.")
 
-# Add the console handler to the logger
-logger.addHandler(console_handler)
+    if not any(isinstance(handler, logging.FileHandler) for handler in logger.handlers):
+        # File handler
+        file_handler = logging.FileHandler('gateway_debug.log')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+        logger.debug("File handler added.")
+
+    return logger
+
+def set_console_level(logger: logging.Logger, level: str) -> None:
+    """Set the logging level of the console handler."""
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            if level.upper() == 'DEBUG':
+                handler.setLevel(logging.DEBUG)
+            elif level.upper() == 'INFO':
+                handler.setLevel(logging.INFO)
+            else:
+                raise ValueError("Invalid level: choose 'DEBUG' or 'INFO'")
+            logger.info(f"Console logging level set to {level.upper()}.")
+            break
+
+def disable_console_handler(logger: logging.Logger) -> None:
+    """Remove the console handler from the logger."""
+    handlers_to_remove = [h for h in logger.handlers if isinstance(h, logging.StreamHandler)]
+    for handler in handlers_to_remove:
+        logger.removeHandler(handler)
+        handler.close()
+    logger.debug(f"Console handler removed. Remaining handlers: {logger.handlers}")
+    logger.info("Console logging has been disabled.")
+
+# Initialize the logger
+logger = setup_logger()
 
 def get_credentials(account_id: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """
-    Retrieve credentials for a given account.
-
-    :param account_id: The account ID for which credentials are being retrieved.
-    :return: A tuple containing the username, password, port, and container name.
-    """
+    """Retrieve credentials for a given account."""
     try:
-        container_name = get_1password_secret(f"op://trade/{account_id}/org",force_refresh=True)
-        master_acc = get_1password_secret(f"op://trade/{account_id}/gateway",force_refresh=True)
+        container_name = get_1password_secret(f"op://trade/{account_id}/org", force_refresh=True)
+        master_acc = get_1password_secret(f"op://trade/{account_id}/gateway", force_refresh=True)
         
-        # Log and check for None or empty master_acc
         if not master_acc:
             logger.error(f"Retrieved master_acc for account '{account_id}' is None or empty.")
             return None, None, None, None
@@ -45,7 +75,6 @@ def get_credentials(account_id: str) -> Tuple[Optional[str], Optional[str], Opti
         username = get_1password_secret(f"op://trade/{master_acc}/username")
         password = get_1password_secret(f"op://trade/{master_acc}/password")
         
-        # Log if any retrieved value is None
         if not username:
             logger.error(f"Failed to retrieve username for account '{account_id}' using master_acc '{master_acc}'")
         if not password:
@@ -58,19 +87,12 @@ def get_credentials(account_id: str) -> Tuple[Optional[str], Optional[str], Opti
         logger.error(f"Failed to retrieve credentials for account ID '{account_id}': {e}")
         return None, None, None, None
 
-
 def is_container_running(container_name: str) -> bool:
-    """
-    Check if the Docker container for the given container name is running.
-
-    :param container_name: The name of the Docker container.
-    :return: True if the container is running, False otherwise.
-    """
+    """Check if the Docker container for the given container name is running."""
     try:
         result = subprocess.run(
             ['docker', 'inspect', '--format={{.State.Running}}', container_name],
-            capture_output=True,
-            text=True
+            capture_output=True, text=True
         )
         if result.returncode == 0:
             is_running = result.stdout.strip().lower() == 'true'
@@ -84,14 +106,7 @@ def is_container_running(container_name: str) -> bool:
         return False
 
 def manage_docker_container(account_id: Optional[str], action: str, force: bool = False) -> str:
-    """
-    Start, stop, or check the status of the Docker container based on the action.
-
-    :param account_id: The account ID associated with the container.
-    :param action: The action to perform ('start', 'stop', or 'status').
-    :param force: Whether to force the start of the container.
-    :return: A message indicating the result of the action.
-    """
+    """Start, stop, or check the status of the Docker container based on the action."""
     if account_id is None:
         return show_all_containers()
 
@@ -101,7 +116,6 @@ def manage_docker_container(account_id: Optional[str], action: str, force: bool 
 
     try:
         if action in ['start', 'stop']:
-            # Stop and remove the container if it exists
             if is_container_running(container_name):
                 logger.info(f"Stopping Docker container named '{container_name}' ...")
                 stop_result = subprocess.run(['docker', 'stop', container_name], capture_output=True, text=True)
@@ -152,13 +166,8 @@ def manage_docker_container(account_id: Optional[str], action: str, force: bool 
         logger.error(f"Failed to manage IBEAM Gateway for {account_id}: {e}")
         return f"Failed to manage IBEAM Gateway for {account_id}: {e}"
 
-
 def show_all_containers() -> str:
-    """
-    Show the status of all running Docker containers.
-
-    :return: A string listing all running Docker containers.
-    """
+    """Show the status of all running Docker containers."""
     logger.info("Displaying all running Docker containers...")
     try:
         result = subprocess.run(['docker', 'ps'], capture_output=True, text=True)
@@ -172,11 +181,7 @@ def show_all_containers() -> str:
         return f"Error retrieving Docker container list: {e}"
 
 def main(args: List[str]) -> None:
-    """
-    Main function to handle command-line arguments and execute corresponding actions.
-
-    :param args: Command-line arguments.
-    """
+    """Main function to handle command-line arguments and execute corresponding actions."""
     if len(args) < 1:
         logger.info("No arguments provided. Showing all running Docker containers.")
         print(show_all_containers())
@@ -184,6 +189,18 @@ def main(args: List[str]) -> None:
 
     try:
         func_name = args[0].lower()
+        if func_name == 'logger' and len(args) > 1:
+            logger_command = args[1].lower()
+            if logger_command == 'info':
+                set_console_level(logger, 'INFO')
+            elif logger_command == 'debug':
+                set_console_level(logger, 'DEBUG')
+            elif logger_command == 'disable':
+                disable_console_handler(logger)
+            else:
+                print(f"Unknown logger command: {logger_command}")
+            sys.exit(0)
+
         topic_id = args[2] if len(args) > 2 else None
         force = args[1].lower() == 'force' if len(args) > 1 else False
 
@@ -202,7 +219,7 @@ def main(args: List[str]) -> None:
         elif func_name == 'status':
             message = manage_docker_container(account_id, 'status')
         else:
-            logger.error(f"Function '{func_name}' not found. Showing all running Docker containers.")
+            logger.debug(f"Function '{func_name}' not found. Showing all running Docker containers.")
             message = show_all_containers()
         
         print(message)
