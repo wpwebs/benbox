@@ -17,21 +17,23 @@ import html
 
 # Set up logging
 def setup_logger() -> logging.Logger:
+    """Set up a logger that outputs INFO level to the console and DEBUG level to a file."""
     logger = logging.getLogger('telegram_bot')
-    logger.setLevel(logging.INFO)  # Set to DEBUG to capture all log levels
+    logger.setLevel(logging.DEBUG)  # Capture all log levels, but handlers will filter output
 
-    # Console handler
+    # Console handler (INFO level)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
-    # Optional: File handler (if you want to log to a file as well)
-    # file_handler = logging.FileHandler('telegram_bot.log')
-    # file_handler.setLevel(logging.DEBUG)
-    # file_handler.setFormatter(console_formatter)
-    # logger.addHandler(file_handler)
+    # File handler (DEBUG level)
+    file_handler = logging.FileHandler('telegram_bot_debug.log')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
 
     return logger
 
@@ -92,7 +94,7 @@ def get_1password_secret(
             )
 
             secret = result.stdout.strip()
-            # logger.debug(f"Raw secret retrieved for {vault_item}: {repr(secret)}")
+            logger.debug(f"Raw secret retrieved for {vault_item}: {repr(secret)}")
 
             # Remove lines that are not part of the secret (e.g., 'Agent pid' lines)
             cleaned_secret = re.sub(r'^.*Agent pid.*$', '', secret, flags=re.MULTILINE).strip()
@@ -107,7 +109,7 @@ def get_1password_secret(
 
             # Cache the cleaned secret
             secret_cache[vault_item] = (cleaned_secret, time.time())
-            logger.info(f"Secret for {vault_item} retrieved, cleaned, and cached.")
+            logger.debug(f"Secret for {vault_item} retrieved, cleaned, and cached.")
 
             return cleaned_secret
 
@@ -123,11 +125,19 @@ def get_1password_secret(
     logger.error(f"Failed to retrieve the secret after {retries} attempts.")
     return None
 
+def escape_markdown_v2(text: str) -> str:
+    """Escape special characters in text for MarkdownV2 format except for backticks."""
+    escape_chars = r'_\[\]()~>#+-={}.!'
+    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
 
 def send_message_to_topic(
-    bot_token: str, chat_id: str, topic_id: str, message: str, chunk_size: int = 4096, retries: int = 3, timeout: int = 10, parse_mode: Optional[str] = "Markdown"
+    bot_token: str, chat_id: str, topic_id: str, message: str, chunk_size: int = 4096, retries: int = 3, timeout: int = 10, parse_mode: Optional[str] = "MarkdownV2"
 ) -> Optional[dict]:
     url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+
+    # Escape the message if using MarkdownV2
+    if parse_mode == "MarkdownV2":
+        message = escape_markdown_v2(message)
 
     # Split the message into chunks if it exceeds the chunk size
     message_sections = message.split("\n\n")
@@ -150,17 +160,16 @@ def send_message_to_topic(
                 params = {
                     'chat_id': chat_id,
                     'text': chunk,
-                    'message_thread_id': topic_id
+                    'message_thread_id': topic_id,
+                    'parse_mode': parse_mode
                 }
-                if parse_mode:
-                    params['parse_mode'] = parse_mode
                 
-                response = requests.get(url, params=params, timeout=timeout)
+                response = requests.post(url, data=params, timeout=timeout)
                 response.raise_for_status()
                 time.sleep(0.5)
             return response.json()
         except requests.HTTPError as e:
-            logger.error(f"HTTPError on attempt {attempt + 1}: {e}")
+            logger.error(f"HTTPError on attempt {attempt + 1}: {e.response.text}")
             time.sleep(2)
         except requests.RequestException as e:
             logger.error(f"RequestException on attempt {attempt + 1}: {e}")
@@ -228,10 +237,10 @@ async def handle_command(update: Update, context: CallbackContext, script_name: 
     args += [chat_id, topic_id, bot_token]
 
     command: str = script_name.replace("_handle.py", "")
-    acknowledgment_message: str = f"Command {command} received. Executing..."
+    acknowledgment_message: str = f"Command `{command}` received. Executing..."
 
     # Send acknowledgment message
-    send_message_to_topic(bot_token, chat_id, topic_id, acknowledgment_message, parse_mode=None)
+    send_message_to_topic(bot_token, chat_id, topic_id, acknowledgment_message, parse_mode='MarkdownV2')
 
     # Execute the command
     output: str = execute_command(script_name, args)
@@ -318,11 +327,22 @@ async def handle_info(THREAD_ID_TO_TOPIC_NAME: Dict[str, str], update: Update, c
     chat_id: int = update.message.chat_id
     chat_title: str = update.message.chat.title if update.message.chat.title else "No Title"
     thread_id: str = str(update.message.message_thread_id)
-    topic_name: str = THREAD_ID_TO_TOPIC_NAME.get(thread_id, "Unknown Topic")
+    allias_id: str = THREAD_ID_TO_TOPIC_NAME.get(thread_id, "Unknown Topic")
+    strategy = get_1password_secret(f"op://trade/{allias_id}/strategy")    
+    account_id = get_1password_secret(f"op://trade/{allias_id}/account")
 
-    message: str = f"**Topic Information:**\nChannel Name: {chat_title}\nChat ID: {chat_id}\nThread ID: {thread_id}\nTopic Name: {topic_name}"
+    message: str = (
+        f"*Topic Information:*\n"
+        f"Channel Name: {chat_title}\n"
+        f"Chat ID: `{chat_id}`\n"
+        f"Thread ID: `{thread_id}`\n"
+        f"Account: ||{account_id}||\n"
+        f"Strategy: {strategy}"
+    )
     
-    response: Optional[Dict[str, Any]] = send_message_to_topic(context.bot.token, chat_id, thread_id, message)
+    response: Optional[Dict[str, Any]] = send_message_to_topic(
+        context.bot.token, chat_id, thread_id, message, parse_mode='MarkdownV2'
+    )
     if response and response.get('ok'):
         logger.info("Message sent successfully")
     else:
