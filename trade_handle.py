@@ -718,7 +718,9 @@ def positions(account_id: str, base_url: str) -> Optional[List[Dict[str, Any]]]:
                     positions_data = filter_positions(positions_data)
                     if not positions_data:
                         logger.debug(f"No positions found for account {account_id}.")
-                        return None
+                        required_columns = ['Ticker', 'Position', 'conid', 'mktValue', 'PnL', 'avgCost', 'mktPrice']
+                        positions_df = pd.DataFrame(columns=required_columns)
+                        return positions_df
                     else:
                         positions_df = pd.DataFrame(positions_data)                  
                         if len(positions_df) > 1:
@@ -1329,14 +1331,14 @@ def format_tickers_message(result: Union[Dict[str, Any], List[str]], strategy: O
     return message
 
 
-def pretty_df(df: pd.DataFrame, index: bool = True) -> str:
+def pretty_df(df: pd.DataFrame, index: bool = False) -> str:
     
     logger.debug(f"Executing `{pretty_df.__name__}` function with arguments: df={df}, index={index}")
     
     # Handle an empty DataFrame
     if df.empty:
-        return "The DataFrame is empty."
-
+        return df
+    
     # Convert index to column(s) if index=True
     if index:
         df = df.reset_index()
